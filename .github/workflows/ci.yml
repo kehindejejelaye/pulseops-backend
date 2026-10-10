@@ -1,0 +1,150 @@
+name: Backend DevSecOps CI
+
+on:
+  push:
+    branches: [ main, dev ]
+    tags: [ 'v*.*.*' ]
+  pull_request:
+    branches: [ main, dev ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/pulseops-backend
+
+jobs:
+  quality-and-security-gates:
+    name: 1. Gitleaks, Lint, Unit Tests & SonarQube SAST
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code (Full History for Scanners)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # -------------------------------------------------------------
+      # Security Gate 1: Gitleaks Secret Scanner
+      # Detects hardcoded secrets/tokens before anything builds
+      # -------------------------------------------------------------
+      - name: Run Gitleaks Secret Scanner
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      # -------------------------------------------------------------
+      # Code Quality Gate: Linting
+      # -------------------------------------------------------------
+      - name: Lint Backend Code (ESLint)
+        run: npm run lint
+
+      # -------------------------------------------------------------
+      # Test Gate: Unit Tests
+      # -------------------------------------------------------------
+      - name: Run Backend Unit Tests
+        run: npm test
+
+      # -------------------------------------------------------------
+      # Security Gate 2: SonarQube / SonarCloud SAST Analysis
+      # -------------------------------------------------------------
+      - name: SonarQube SAST Scan
+        uses: SonarSource/sonarqube-scan-action@v3
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        continue-on-error: true # Set to false to strictly enforce Quality Gate blocking
+
+  build-scan-and-publish:
+    name: 2. Docker Build, Trivy Scan & Push to GHCR
+    needs: quality-and-security-gates
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Determine environment: dev vs prod
+      - name: Set Environment Name
+        id: env_name
+        run: |
+          if [[ "${{ github.ref }}" == "refs/heads/main" || "${{ github.base_ref }}" == "main" ]]; then
+            echo "ENV_NAME=prod" >> $GITHUB_OUTPUT
+          else
+            echo "ENV_NAME=dev" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # -------------------------------------------------------------
+      # Tagging Strategy:
+      # - dev branch push/merge -> dev, dev-sha-<hash>
+      # - main branch push/merge -> prod, latest, prod-sha-<hash>
+      # - git release tags (v1.0.0) -> 1.0.0, v1.0.0
+      # -------------------------------------------------------------
+      - name: Extract Docker metadata & tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
+            type=sha,prefix=dev-sha-,format=short,enable=${{ github.ref == 'refs/heads/dev' }}
+            type=raw,value=prod,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=prod-sha-,format=short,enable=${{ github.ref == 'refs/heads/main' }}
+            type=semver,pattern={{version}}
+
+      # Build Docker image locally for vulnerability inspection
+      - name: Build Docker Image for Scanning
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:local-test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # -------------------------------------------------------------
+      # Security Gate 3: Trivy Container Vulnerability Scan
+      # -------------------------------------------------------------
+      - name: Run Trivy Vulnerability Scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:local-test
+          format: 'table'
+          exit-code: '0' # Change to '1' when ready to hard-fail pipeline on CRITICAL CVEs
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+      # Push final verified image to GHCR upon merge/push to dev or main
+      - name: Push Image to GHCR (${{ steps.env_name.outputs.ENV_NAME }})
+        # if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
